@@ -71,10 +71,10 @@ pub unsafe trait ApplyConfig {
     fn apply(&self, cfg: &mut ma_device_config);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct DirPlayback;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct DirCapture;
 
 pub struct Playback<P: SampleFormat, CB: FnMut(&mut [P]) + Send + 'static> {
