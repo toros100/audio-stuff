@@ -550,6 +550,20 @@ mod drop_tests {
     use std::fmt::Debug;
     use std::ptr::addr_of;
 
+    struct DummyHandle(*mut AtomicUsize);
+
+    impl Drop for DummyHandle {
+        fn drop(&mut self) {
+            _ = unsafe { Box::from_raw(self.0) };
+        }
+    }
+
+    impl DummyHandle {
+        fn load_drop_count(&self) -> usize {
+            unsafe { (*self.0).load(std::sync::atomic::Ordering::Relaxed) }
+        }
+    }
+
     #[derive(Debug)]
     enum DropDummy {
         Tracked(*const AtomicUsize),
@@ -557,23 +571,24 @@ mod drop_tests {
     }
 
     impl DropDummy {
-        // creates a new "tracked" dummy: the boxed AtomicUsize may be checked to see how many times
+        // creates a new "tracked" dummy: the DummyHandle may be checked to see how many times
         // the dummy was dropped. (this can obviously only happen if the dummy is duplicated using
         // unsafe, which is exactly what we are trying to test with this)
-        // WARN: the returned Box<AtomicUsize> must outlive the dummy
-        fn new_tracked() -> (Self, Box<AtomicUsize>) {
+        // WARN: the returned DummyHandle must outlive the dummy (and any copies)
+        fn new_tracked() -> (Self, DummyHandle) {
             let bx = Box::new(AtomicUsize::new(0));
-            let dropped_count = &*bx as *const AtomicUsize;
-            (DropDummy::Tracked(dropped_count), bx)
+            let ptr = Box::into_raw(bx);
+            let dropped_count = ptr as *const AtomicUsize;
+            (DropDummy::Tracked(dropped_count), DummyHandle(ptr))
         }
         // creates an "untracked" dummy: this is so that we can push items of the same type (the
-        // enum type) into the buffer without having to juggle additional boxes
+        // enum type) into the buffer without having to juggle additional handles
         fn new_untracked() -> Self {
             DropDummy::Untracked
         }
     }
 
-    // fine to send, just keep the box alive
+    // fine to send, just keep the handle alive
     unsafe impl Send for DropDummy {}
 
     impl Drop for DropDummy {
@@ -581,11 +596,11 @@ mod drop_tests {
             if let DropDummy::Tracked(dropped_count) = self {
                 // this is the cleanest way i could come up with to safely be able to drop
                 // multiple unsafe copies of the same value, while being able to track it.
-                // as long as the corresponding Box<AtomicUsize> is kept alive, this should be
+                // as long as the corresponding DummyHandle is kept alive, this should be
                 // safe and allow testing multiple drops without causing any ub or actually
                 // corrupting the heap (which tends to just completely abort the test harness)
                 _ = unsafe {
-                    (*(*dropped_count)).fetch_add(1, std::sync::atomic::Ordering::Release)
+                    (*(*dropped_count)).fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 };
             }
         }
@@ -593,28 +608,28 @@ mod drop_tests {
 
     #[test]
     fn drop_dummy_sanity_check() {
-        let (dd, bx) = DropDummy::new_tracked();
+        let (dd, h) = DropDummy::new_tracked();
 
-        assert_eq!(bx.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(h.load_drop_count(), 0);
 
         {
             let ptr = addr_of!(dd);
             let _illegal_duplicate = unsafe { ptr.read() };
         }
 
-        assert_eq!(bx.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(h.load_drop_count(), 1);
 
         drop(dd);
 
-        assert_eq!(bx.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(h.load_drop_count(), 2);
     }
 
     #[test]
     fn drop_exactly_once() {
-        fn check_and_count_drops(bxs: &[(usize, Box<AtomicUsize>)]) -> usize {
+        fn check_and_count_drops(bxs: &[(usize, DummyHandle)]) -> usize {
             bxs.iter()
                 .map(|(id, bx)| {
-                    let ct = bx.load(std::sync::atomic::Ordering::Relaxed);
+                    let ct = bx.load_drop_count();
 
                     if ct > 1 {
                         eprintln!("DropDummy {} was dropped {} times", id, ct);
@@ -625,11 +640,12 @@ mod drop_tests {
                 .sum()
         }
 
-        let mut bxs = Vec::new();
+        let mut handles = Vec::new();
 
-        // WARN: it's important that bxs is declared first, to ensure that it is dropped after
+        // WARN: it's important that handles is declared first, to ensure that it is dropped after
         // the tx/rx are, because the drop impl of SharedArray will drop any remaining
-        // DropDummy values, which will dereference a pointer into one of the boxes.
+        // DropDummy values, which will dereference a pointer to an AtomicUsize that is dropped
+        // when the DummyHandle is dropped.
         // (should not happen if the test behaves as expected, but there should still not be any ub
         // just because a test went wrong)
 
@@ -637,20 +653,20 @@ mod drop_tests {
 
         // inserting 64 items
         for i in 0..64usize {
-            let (dd, bx) = DropDummy::new_tracked();
-            bxs.push((i, bx));
+            let (dd, h) = DropDummy::new_tracked();
+            handles.push((i, h));
             assert!(tx.push(i as u16, dd).is_none());
         }
 
         assert_eq!(rx.len_hint(), 64);
-        assert_eq!(check_and_count_drops(&bxs), 0);
+        assert_eq!(check_and_count_drops(&handles), 0);
 
         for _ in 0..32 {
             assert_matches!(rx.pop(), PopResult::Data(_, _));
         }
 
         assert_eq!(rx.len_hint(), 32);
-        assert_eq!(check_and_count_drops(&bxs), 32);
+        assert_eq!(check_and_count_drops(&handles), 32);
 
         let dd = DropDummy::new_untracked();
 
@@ -664,14 +680,14 @@ mod drop_tests {
         assert_eq!(rx.len_hint(), 33);
 
         // dummies still there, not dropped
-        assert_eq!(check_and_count_drops(&bxs), 32);
+        assert_eq!(check_and_count_drops(&handles), 32);
 
         // the untracked dummy with seq 1000 is the next pop result, the reader just skipped over 32
         // cells with CellState::Skip
         assert_matches!(rx.pop(), PopResult::Data(1000, DropDummy::Untracked));
 
         // still there
-        assert_eq!(check_and_count_drops(&bxs), 32);
+        assert_eq!(check_and_count_drops(&handles), 32);
 
         // observe that we just reduced len_hint from 33 to 0 with a single pop
         assert_eq!(rx.len_hint(), 0);
@@ -684,7 +700,7 @@ mod drop_tests {
 
         // the dummies are still there, because the previous 31 untracked ones just overwrote
         // different slots in the buffer
-        assert_eq!(check_and_count_drops(&bxs), 32);
+        assert_eq!(check_and_count_drops(&handles), 32);
 
         // this is getting a bit mean, we should set them free now
 
@@ -694,11 +710,11 @@ mod drop_tests {
             assert!(tx.push(i, dd).is_none());
         }
 
-        assert_eq!(check_and_count_drops(&bxs), 64);
+        assert_eq!(check_and_count_drops(&handles), 64);
 
         drop(tx);
         drop(rx);
 
-        assert_eq!(check_and_count_drops(&bxs), 64)
+        assert_eq!(check_and_count_drops(&handles), 64)
     }
 }
