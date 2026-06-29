@@ -39,7 +39,7 @@ impl MaError {
 
 /// # Safety
 /// TODO
-pub unsafe trait SampleFormat: 'static + private::Sealed {
+pub unsafe trait SampleFormat: 'static + private::Sealed + Default + Send + Copy {
     const MA_FORMAT: ma_bindings::ma_format;
 }
 
