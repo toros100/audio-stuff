@@ -1,8 +1,42 @@
-use std::{cell::UnsafeCell, mem::MaybeUninit};
+use std::marker::PhantomData;
+use std::mem::MaybeUninit;
+
+#[cfg(loom)]
+use loom::cell::UnsafeCell;
+
+#[cfg(not(loom))]
+use std::cell::UnsafeCell;
+
+fn with_cell<T, R>(cell: &UnsafeCell<T>, f: impl FnOnce(*const T) -> R) -> R {
+    #[cfg(loom)]
+    return cell.with(f);
+
+    #[cfg(not(loom))]
+    return f(cell.get());
+}
+
+fn with_cell_mut<T, R>(cell: &UnsafeCell<T>, f: impl FnOnce(*mut T) -> R) -> R {
+    #[cfg(loom)]
+    return cell.with_mut(f);
+
+    #[cfg(not(loom))]
+    return f(cell.get());
+}
 
 pub(crate) struct SharedArray<T, const N: usize> {
     vals: [UnsafeCell<MaybeUninit<T>>; N],
     live_vals: [UnsafeCell<bool>; N],
+    _phantom: PhantomData<T>,
+}
+
+impl<T, const N: usize> Default for SharedArray<T, N> {
+    fn default() -> Self {
+        Self {
+            vals: std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit())),
+            live_vals: std::array::from_fn(|_| UnsafeCell::new(false)),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<T, const N: usize> SharedArray<T, N> {
@@ -11,14 +45,12 @@ impl<T, const N: usize> SharedArray<T, N> {
     /// calling this.
     /// may not be called concurrently with any method on SharedArray on the same i.
     pub(crate) unsafe fn take(&self, i: usize) -> T {
-        if cfg!(debug_assertions) {
-            let live = unsafe { *self.live_vals[i].get() };
-            debug_assert!(live);
-        }
-
         unsafe {
-            self.live_vals[i].get().write(false);
-            (*self.vals[i].get()).assume_init_read()
+            with_cell_mut(&self.live_vals[i], |p| {
+                debug_assert!(*p, "value should be live when taking");
+                *p = false;
+                with_cell(&self.vals[i], |q| (*q).assume_init_read())
+            })
         }
     }
 
@@ -27,15 +59,17 @@ impl<T, const N: usize> SharedArray<T, N> {
     /// may not be called concurrently with any method on SharedArray on the same i.
     pub(crate) unsafe fn insert(&self, i: usize, t: T) {
         unsafe {
-            let live = *self.live_vals[i].get();
-
-            if live {
-                (*self.vals[i].get()).assume_init_drop();
-            } else {
-                self.live_vals[i].get().write(true);
-            }
-
-            (*self.vals[i].get()).write(t);
+            with_cell_mut(&self.live_vals[i], |p| {
+                with_cell_mut(&self.vals[i], |q| {
+                    if *p {
+                        (*q).assume_init_drop();
+                        (*q).write(t);
+                    } else {
+                        (*q).write(t);
+                        (*p) = true;
+                    }
+                })
+            });
         }
     }
 
@@ -43,28 +77,12 @@ impl<T, const N: usize> SharedArray<T, N> {
     /// may not be called concurrently with any method on SharedArray on the same i.
     pub(crate) unsafe fn drop_if_present(&self, i: usize) {
         unsafe {
-            let live = *self.live_vals[i].get();
-            if live {
-                (*self.vals[i].get()).assume_init_drop();
-                self.live_vals[i].get().write(false);
-            }
+            with_cell_mut(&self.live_vals[i], |p| {
+                if *p {
+                    with_cell_mut(&self.vals[i], |q| (*q).assume_init_drop());
+                    *p = false;
+                }
+            })
         };
-    }
-}
-
-impl<T, const N: usize> Default for SharedArray<T, N> {
-    fn default() -> Self {
-        let vals = std::array::from_fn(|_| UnsafeCell::new(MaybeUninit::uninit()));
-        let live_vals = std::array::from_fn(|_| UnsafeCell::new(false));
-        Self { vals, live_vals }
-    }
-}
-impl<T, const N: usize> Drop for SharedArray<T, N> {
-    fn drop(&mut self) {
-        for i in 0..N {
-            unsafe {
-                self.drop_if_present(i);
-            }
-        }
     }
 }

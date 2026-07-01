@@ -1,7 +1,34 @@
+#[cfg(not(loom))]
 use std::sync::{
     Arc,
     atomic::{AtomicU32, AtomicUsize},
 };
+
+#[cfg(loom)]
+use loom::sync::{
+    Arc,
+    atomic::{AtomicU32, AtomicUsize},
+};
+
+// # push behaviour spec
+//
+// if seq is way off:
+// set everything to clear, set expected_seq even if we can't push it
+// why do that unconditionally?
+// because we just expect that to be the new time basis?
+//
+// if set is a bit off:
+//
+// seq in the past:
+// try to insert into placeholder, if one exists, otherwise what?
+// discard value? or return value?
+//
+// there is not really any point in returning the value? it will never be pushable?
+//
+// seq in the present-future:
+//
+// insert
+//
 
 use crate::shared_array::SharedArray;
 
@@ -61,7 +88,7 @@ pub fn new_pair<T, const N: usize>() -> (Writer<T, N>, Reader<T, N>) {
     (w, r)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum PopResult<T> {
     Empty,
     Missing(u16),
@@ -104,18 +131,24 @@ impl CellState {
     }
 }
 
-fn wrapping_range_u16(start: u16, end: u16) -> impl Iterator<Item = u16> {
+fn wrapping_range_u16(start: u16, end: u16) -> impl DoubleEndedIterator<Item = u16> {
     let n = end.wrapping_sub(start);
     (0u16..n).map(move |i| start.wrapping_add(i))
 }
 
-fn wrapping_range_usize(start: usize, end: usize) -> impl Iterator<Item = usize> {
+fn wrapping_range_usize(start: usize, end: usize) -> impl DoubleEndedIterator<Item = usize> {
     let n = end.wrapping_sub(start);
     (0usize..n).map(move |i| start.wrapping_add(i))
 }
 
 fn wrapping_range_usize_contains(start: usize, end: usize, val: usize) -> bool {
     val.wrapping_sub(start) < end.wrapping_sub(start)
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum PushError<T> {
+    Stale(u16, T),
+    Full(u16, T),
 }
 
 impl<T, const N: usize> Writer<T, N> {
@@ -141,12 +174,23 @@ impl<T, const N: usize> Writer<T, N> {
         seq.wrapping_sub(self.expected_seq) as i16
     }
 
-    pub fn push(&mut self, seq: u16, data: T) -> Option<T> {
+    fn ass(&self) {
+        debug_assert_eq!(
+            self.write_head_local,
+            self.shared
+                .write_head
+                .load(std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
+    pub fn push(&mut self, seq: u16, data: T) -> Result<(), PushError<T>> {
         const {
             assert!(N.is_power_of_two());
             assert!(Self::JUMP_THRESH > 0);
             assert!((Self::JUMP_THRESH as usize) <= N);
         };
+
+        // TODO: rewrite this bs
 
         debug_assert_eq!(
             self.write_head_local,
@@ -169,7 +213,7 @@ impl<T, const N: usize> Writer<T, N> {
             // "timeline"
 
             let skip = CellState::Skip.pack();
-            for i in wrapping_range_usize(read, self.write_head_local) {
+            for i in wrapping_range_usize(read, self.write_head_local).rev() {
                 let idx = i % N;
                 // NOTE: we can NOT safely remove values in self.arr at idx at this point, because the
                 // reader could be accessing the same index concurrently, in case we overwrote
@@ -177,14 +221,17 @@ impl<T, const N: usize> Writer<T, N> {
                 // this could be solved with additional synchronization, but we will just drop any
                 // leftover values after the reader advances past the corresponding index again.
 
-                self.shared.cells[idx].store(skip, std::sync::atomic::Ordering::Relaxed);
+                // reversed the iterator and used Release ordering to make the "skipped" area more
+                // coherent
+                self.shared.cells[idx].store(skip, std::sync::atomic::Ordering::Release);
             }
 
             self.expected_seq = seq.wrapping_add(1);
 
             if self.write_head_local.wrapping_sub(N) == read {
+                self.ass();
                 // buffer is full
-                Some(data)
+                Err(PushError::Full(seq, data))
             } else {
                 let idx = self.write_head_local % N;
 
@@ -205,9 +252,11 @@ impl<T, const N: usize> Writer<T, N> {
 
                 self.shared
                     .write_head
-                    .store(self.write_head_local, std::sync::atomic::Ordering::Relaxed);
+                    .store(self.write_head_local, std::sync::atomic::Ordering::Release);
 
-                None
+                self.ass();
+
+                Ok(())
             }
         } else {
             let d = self.diff(seq);
@@ -220,12 +269,14 @@ impl<T, const N: usize> Writer<T, N> {
                     let idx = pos % N;
                     let expected_state = CellState::Reserved(seq).pack();
 
-                    if self.shared.cells[idx].load(std::sync::atomic::Ordering::Relaxed)
+                    if self.shared.cells[idx].load(std::sync::atomic::Ordering::Acquire)
                         == expected_state
                     {
                         // SAFETY:
                         // state was CellState::Reserved(_), thus the reader is not accessing
                         // the shared array at idx
+                        // (no need to do CAS here, because the writer is the only one modifying
+                        // cell state)
                         unsafe {
                             self.shared.arr.insert(idx, data);
                         }
@@ -236,10 +287,10 @@ impl<T, const N: usize> Writer<T, N> {
                             CellState::Data(seq).pack(),
                             std::sync::atomic::Ordering::Release,
                         );
-                        return None;
+                        return Ok(());
                     }
                 }
-                Some(data)
+                Err(PushError::Stale(seq, data))
             } else {
                 // seq is the expected sequence number or a future sequence number
 
@@ -263,10 +314,16 @@ impl<T, const N: usize> Writer<T, N> {
 
                         // no need to impose ordering here, after seeing Reserved(_) the reader
                         // will not touch the corresponding shared array index
+                        // TODO: think about reversed iteration + release ordering here
                         self.shared.cells[idx].store(val, std::sync::atomic::Ordering::Relaxed);
                         self.write_head_local = self.write_head_local.wrapping_add(1);
+                        self.expected_seq = s.wrapping_add(1)
                     }
                 }
+
+                self.shared
+                    .write_head
+                    .store(self.write_head_local, std::sync::atomic::Ordering::Release);
 
                 let ret = if self.write_head_local != read.wrapping_add(N) {
                     let idx = self.write_head_local % N;
@@ -284,18 +341,23 @@ impl<T, const N: usize> Writer<T, N> {
                     // visible to the reader after seeing Data(_)
                     self.shared.cells[idx].store(val, std::sync::atomic::Ordering::Release);
                     self.write_head_local = self.write_head_local.wrapping_add(1);
-                    None
+                    Ok(())
                 } else {
-                    Some(data)
+                    Err(PushError::Full(seq, data))
                 };
 
-                // Relaxed ordering is sufficient here, the array writes are ordered by the cell stores
-                // with Release ordering
-                self.shared
-                    .write_head
-                    .store(self.write_head_local, std::sync::atomic::Ordering::Relaxed);
+                // Release is required here after all
+                if ret.is_ok() {
+                    self.shared
+                        .write_head
+                        .store(self.write_head_local, std::sync::atomic::Ordering::Release);
+                    self.ass();
+                }
 
-                self.expected_seq = seq.wrapping_add(1);
+                if ret.is_ok() {
+                    // i hate this
+                    self.expected_seq = seq.wrapping_add(1);
+                }
                 ret
             }
         }
@@ -325,13 +387,13 @@ impl<T, const N: usize> Reader<T, N> {
                 .load(std::sync::atomic::Ordering::Relaxed)
         );
 
-        let write_head = self
-            .shared
-            .write_head
-            .load(std::sync::atomic::Ordering::Relaxed);
-
         loop {
             // loop instead of recursion to avoid unbounded recursion on pathological inputs
+
+            let write_head = self
+                .shared
+                .write_head
+                .load(std::sync::atomic::Ordering::Acquire);
 
             if self.read_head_local == write_head {
                 break PopResult::Empty;
@@ -357,7 +419,7 @@ impl<T, const N: usize> Reader<T, N> {
                     self.read_head_local = self.read_head_local.wrapping_add(1);
                     self.shared
                         .read_head
-                        .store(self.read_head_local, std::sync::atomic::Ordering::Relaxed);
+                        .store(self.read_head_local, std::sync::atomic::Ordering::Release);
                     break PopResult::Missing(seq);
                 }
                 CellState::Data(seq) => {
@@ -384,6 +446,7 @@ impl<T, const N: usize> Reader<T, N> {
 }
 
 #[cfg(test)]
+#[cfg(not(loom))]
 mod tests {
 
     use super::*;
@@ -414,7 +477,7 @@ mod tests {
         let res = rx.pop();
         assert_matches!(res, PopResult::Empty);
 
-        tx.push(0, 17);
+        assert!(tx.push(0, 17).is_ok());
 
         let res2 = rx.pop();
 
@@ -426,7 +489,7 @@ mod tests {
         let (mut tx, mut rx) = new_pair::<u64, 16>();
 
         for i in 0..16u16 {
-            tx.push(i, i as u64);
+            assert!(tx.push(i, i as u64).is_ok());
         }
 
         for i in 0..16u16 {
@@ -443,7 +506,7 @@ mod tests {
 
         for i in 0..16u16 {
             if i.is_multiple_of(2) {
-                tx.push(i, i as u64);
+                assert!(tx.push(i, i as u64).is_ok());
             }
         }
 
@@ -464,9 +527,9 @@ mod tests {
     fn late_arrival_insertion() {
         let (mut tx, mut rx) = new_pair::<u64, 16>();
 
-        tx.push(0, 0);
-        tx.push(2, 2);
-        tx.push(1, 1);
+        assert!(tx.push(0, 0).is_ok());
+        assert!(tx.push(2, 2).is_ok());
+        assert!(tx.push(1, 1).is_ok());
 
         for i in 0..=3u16 {
             let res = rx.pop();
@@ -481,7 +544,7 @@ mod tests {
         let (mut tx, mut rx) = new_pair::<u64, 16>();
 
         for i in 0..=14u16 {
-            tx.push(i, i as u64);
+            assert!(tx.push(i, i as u64).is_ok());
         }
 
         // at capacity 15/16, room for just one more
@@ -496,7 +559,7 @@ mod tests {
         // frame 14 straight to 16.
 
         let res = tx.push(16, 16);
-        assert_matches!(res, Some(16));
+        assert_matches!(res, Err(PushError::Full(16u16, 16u64)));
 
         for i in 0..14u16 {
             assert_eq!(
@@ -525,12 +588,15 @@ mod tests {
     fn full() {
         let (mut tx, mut rx) = new_pair::<u64, 16>();
 
-        for i in 0..=16u16 {
-            tx.push(i, i as u64);
+        for i in 0..16u16 {
+            match tx.push(i, i as u64) {
+                Ok(()) => {}
+                Err(e) => panic!("expected no push error, found {:?}", e),
+            }
         }
 
         let res = tx.push(16u16, 16u64);
-        assert_eq!(res, Some(16u64));
+        assert_matches!(res, Err(PushError::Full(16u16, 16u64)));
 
         for i in 0..16u16 {
             let res = rx.pop();
@@ -542,6 +608,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg(not(loom))]
 mod drop_tests {
 
     use super::*;
@@ -632,7 +699,7 @@ mod drop_tests {
                     let ct = bx.load_drop_count();
 
                     if ct > 1 {
-                        eprintln!("DropDummy {} was dropped {} times", id, ct);
+                        panic!("DropDummy {} was dropped {} times", id, ct);
                     }
 
                     ct
@@ -655,7 +722,7 @@ mod drop_tests {
         for i in 0..64usize {
             let (dd, h) = DropDummy::new_tracked();
             handles.push((i, h));
-            assert!(tx.push(i as u16, dd).is_none());
+            assert!(tx.push(i as u16, dd).is_ok());
         }
 
         assert_eq!(rx.len_hint(), 64);
@@ -675,7 +742,7 @@ mod drop_tests {
         // the 32 remaining tracked dummies will still be stored, not dropped, but not retrievable
         // anymore. i don't consider this to be a memory leak, because the dummies will be dropped
         // when the corresponding index is overwritten again.
-        assert!(tx.push(1000, dd).is_none());
+        assert!(tx.push(1000, dd).is_ok());
 
         assert_eq!(rx.len_hint(), 33);
 
@@ -695,7 +762,7 @@ mod drop_tests {
         // pushing 31 further dummies
         for i in 1001..1032 {
             let dd = DropDummy::new_untracked();
-            assert!(tx.push(i, dd).is_none());
+            assert!(tx.push(i, dd).is_ok());
         }
 
         // the dummies are still there, because the previous 31 untracked ones just overwrote
@@ -707,7 +774,7 @@ mod drop_tests {
         // pushing 32 further dummies
         for i in 1032..1064 {
             let dd = DropDummy::new_untracked();
-            assert!(tx.push(i, dd).is_none());
+            assert!(tx.push(i, dd).is_ok());
         }
 
         assert_eq!(check_and_count_drops(&handles), 64);
@@ -716,5 +783,236 @@ mod drop_tests {
         drop(rx);
 
         assert_eq!(check_and_count_drops(&handles), 64)
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(loom))]
+mod concurrent_tests {
+    use std::{assert_matches, sync::atomic::AtomicBool, thread};
+
+    use rand::{RngExt, SeedableRng};
+
+    use super::*;
+
+    #[test]
+    fn basic() {
+        let (mut tx, mut rx) = new_pair::<u64, 8>();
+        let vals_to_push = (0..100).map(|i| (i, i as u64)).collect::<Vec<(u16, u64)>>();
+        let expected = vals_to_push.clone();
+
+        let h = std::thread::spawn(move || {
+            for (seq, data) in vals_to_push {
+                loop {
+                    match tx.push(seq, data) {
+                        Ok(()) => break,
+                        Err(PushError::Full(s, d)) => {
+                            assert_eq!((s, d), (seq, data));
+                        }
+                        Err(PushError::Stale(_, _)) => unreachable!(),
+                    }
+                }
+            }
+        });
+
+        let mut seen = Vec::with_capacity(expected.len());
+
+        while seen.len() < expected.len() {
+            loop {
+                match rx.pop() {
+                    PopResult::Data(s, d) => {
+                        seen.push((s, d));
+                        break;
+                    }
+                    PopResult::Missing(_) => unreachable!(),
+                    PopResult::Empty => {}
+                }
+            }
+        }
+
+        h.join().unwrap();
+
+        assert_eq!(seen, expected);
+        assert_matches!(rx.pop(), PopResult::Empty);
+    }
+
+    #[test]
+    fn unique() {
+        let vals_to_push = (0..100).map(|i| (i, i as u64)).collect::<Vec<(u16, u64)>>();
+
+        for _ in 0..100 {
+            let (tx, rx) = new_pair();
+            test_unique_helper(vals_to_push.clone(), tx, rx);
+        }
+    }
+
+    fn test_unique_helper(
+        vals_to_push: Vec<(u16, u64)>,
+        mut tx: Writer<u64, 8>,
+        mut rx: Reader<u64, 8>,
+    ) {
+        let expected = vals_to_push.clone();
+
+        assert_eq!(expected.len(), vals_to_push.len());
+
+        let should_exit = Arc::new(AtomicBool::new(false));
+
+        let should_exit_cl = should_exit.clone();
+
+        let h = std::thread::spawn(move || {
+            for (seq, data) in vals_to_push {
+                loop {
+                    if should_exit_cl.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    match tx.push(seq, data) {
+                        Ok(()) => break,
+                        Err(PushError::Full(s, d)) => {
+                            thread::yield_now();
+                            assert_eq!((s, d), (seq, data));
+                        }
+                        Err(PushError::Stale(s, d)) => {
+                            assert_eq!((s, d), (seq, data));
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut seen = Vec::with_capacity(expected.len());
+
+        'outer: while seen.len() <= expected.len() {
+            loop {
+                match rx.pop() {
+                    PopResult::Empty => {
+                        if h.is_finished() {
+                            break 'outer;
+                        }
+                    }
+                    res => {
+                        seen.push(res);
+                        break;
+                    }
+                }
+            }
+        }
+
+        should_exit.store(true, std::sync::atomic::Ordering::Relaxed);
+        h.join().unwrap();
+
+        for (s, d) in seen.into_iter().enumerate() {
+            match d {
+                PopResult::Missing(seq) => assert_eq!(seq, s as u16),
+                PopResult::Data(seq, u) => {
+                    assert_eq!(seq, s as u16);
+                    assert_eq!(u, s as u64);
+                }
+                PopResult::Empty => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn unique_with_reorder() {
+        fn permute_slightly(v: &mut [(u16, u64)]) {
+            const MAX_REORDER_DIST: usize = 2; // WARN: should really depend on buffer size
+            let mut already_reordered = vec![false; v.len()];
+            let mut rng = rand::rngs::SmallRng::seed_from_u64(123);
+
+            for i in 1..v.len() {
+                let j = rng.random_range((i + 1)..=(i + MAX_REORDER_DIST));
+                if j < v.len() && !already_reordered[j] && !already_reordered[i] {
+                    already_reordered[j] = true;
+                    already_reordered[i] = true;
+                    (v[i], v[j]) = (v[j], v[i]);
+                }
+            }
+        }
+        let mut vals_to_push = (0..100).map(|i| (i, i as u64)).collect::<Vec<(u16, u64)>>();
+        permute_slightly(&mut vals_to_push);
+
+        let mut max_gap = 0;
+
+        for i in 1..vals_to_push.len() {
+            let gap = vals_to_push[i].0.abs_diff(vals_to_push[i - 1].0);
+            max_gap = max_gap.max(gap);
+        }
+
+        assert!(max_gap < 8);
+
+        for _ in 0..100 {
+            let (tx, rx) = new_pair();
+            test_unique_helper(vals_to_push.clone(), tx, rx);
+        }
+    }
+}
+
+#[cfg(test)]
+#[cfg(loom)]
+mod loom_tests {
+    use super::*;
+    use std::assert_matches;
+
+    #[test]
+    fn basic() {
+        loom::model(|| {
+            let (mut tx, mut rx) = new_pair::<u64, 4>();
+
+            let vals_to_push = vec![(0, 0), (1, 1)];
+
+            let expected = vals_to_push.clone();
+
+            let h = loom::thread::spawn(move || {
+                for (seq, data) in vals_to_push {
+                    assert!(tx.push(seq, data).is_ok())
+                }
+            });
+
+            let mut seen = Vec::new();
+            while seen.len() < expected.len() {
+                match rx.pop() {
+                    PopResult::Empty => loom::thread::yield_now(),
+                    PopResult::Data(seq, data) => seen.push((seq, data)),
+                    _ => unreachable!(),
+                }
+            }
+
+            assert_matches!(rx.pop(), PopResult::Empty);
+
+            assert_eq!(seen, expected);
+            h.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn reorder_insert() {
+        loom::model(|| {
+            let (mut tx, mut rx) = new_pair::<u64, 4>();
+
+            let vals_to_push = vec![(0, 0), (2, 2), (1, 1)];
+
+            let expected = vals_to_push.clone();
+
+            let h = loom::thread::spawn(move || {
+                assert_matches!(tx.push(0, 0), Ok(()));
+                assert_matches!(tx.push(2, 2), Ok(()));
+                // if the reader already read 0, we can't insert 1 anymore
+                assert_matches!(tx.push(1, 1), Err(PushError::Stale(1, 1)) | Ok(()));
+            });
+
+            let mut seen = Vec::with_capacity(expected.len());
+            while seen.len() < expected.len() {
+                match rx.pop() {
+                    PopResult::Empty => loom::thread::yield_now(),
+                    s => seen.push(s),
+                }
+            }
+
+            assert_matches!(seen[0], PopResult::Data(0, 0u64));
+            assert_matches!(seen[1], PopResult::Data(1, 1) | PopResult::Missing(1));
+            assert_matches!(seen[2], PopResult::Data(2, 2));
+            h.join().unwrap();
+        });
     }
 }
